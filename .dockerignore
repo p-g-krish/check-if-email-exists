@@ -1,5 +1,8 @@
 .git
 .github
+.vscode
 ci
-target
-test_suite
+target/
+Dockerfile.*
+docs/
+.env

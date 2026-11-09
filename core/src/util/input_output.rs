@@ -1,30 +1,82 @@
-// check-if-email-exists
-// Copyright (C) 2018-2022 Reacher
-
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published
-// by the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
 use crate::misc::{MiscDetails, MiscError};
 use crate::mx::{MxDetails, MxError};
-use crate::smtp::{SmtpDetails, SmtpError, SmtpErrorDesc};
+use crate::smtp::verif_method::VerifMethod;
+use crate::smtp::{SmtpDebug, SmtpDetails, SmtpError, SmtpErrorDesc};
 use crate::syntax::SyntaxDetails;
-use async_smtp::{ClientSecurity, ClientTlsParameters};
+use crate::util::ser_with_display::ser_with_display;
+use async_smtp::EmailAddress as AsyncSmtpEmailAddress;
+use chrono::{DateTime, Utc};
+use derive_builder::Builder;
 use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
-use std::time::Duration;
+use std::fmt::Display;
+use std::str::FromStr;
+use std::time::{Duration, SystemTime};
+
+/// Wrapper around the `EmailAddress` from `async_smtp` to allow for
+/// serialization and deserialization.
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub struct EmailAddress(AsyncSmtpEmailAddress);
+
+impl Serialize for EmailAddress {
+	fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+	where
+		S: Serializer,
+	{
+		ser_with_display(&self.0, serializer)
+	}
+}
+
+impl<'de> Deserialize<'de> for EmailAddress {
+	fn deserialize<D>(deserializer: D) -> Result<EmailAddress, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		let s = String::deserialize(deserializer)?;
+		Ok(EmailAddress(
+			AsyncSmtpEmailAddress::from_str(&s).map_err(serde::de::Error::custom)?,
+		))
+	}
+}
+
+impl Display for EmailAddress {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.0.fmt(f)
+	}
+}
+
+impl FromStr for EmailAddress {
+	type Err = anyhow::Error;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		Ok(EmailAddress(AsyncSmtpEmailAddress::from_str(s)?))
+	}
+}
+
+impl EmailAddress {
+	pub fn new(email: String) -> Result<Self, anyhow::Error> {
+		Ok(EmailAddress(AsyncSmtpEmailAddress::new(email)?))
+	}
+
+	pub fn into_inner(self) -> AsyncSmtpEmailAddress {
+		self.0
+	}
+}
+
+impl AsRef<AsyncSmtpEmailAddress> for EmailAddress {
+	fn as_ref(&self) -> &AsyncSmtpEmailAddress {
+		&self.0
+	}
+}
+
+impl AsRef<str> for EmailAddress {
+	fn as_ref(&self) -> &str {
+		self.0.as_ref()
+	}
+}
 
 /// Perform the email verification via a specified proxy. The usage of a proxy
 /// is optional.
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, PartialEq, Serialize)]
 pub struct CheckEmailInputProxy {
 	/// Use the specified SOCKS5 proxy host to perform email verification.
 	pub host: String,
@@ -34,194 +86,67 @@ pub struct CheckEmailInputProxy {
 	pub username: Option<String>,
 	/// Password to pass to proxy authentication.
 	pub password: Option<String>,
-}
-
-/// Define how to apply TLS to a SMTP client connection. Will be converted into
-/// async_smtp::ClientSecurity.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-pub enum SmtpSecurity {
-	/// Insecure connection only (for testing purposes).
-	None,
-	/// Start with insecure connection and use `STARTTLS` when available.
-	Opportunistic,
-	/// Start with insecure connection and require `STARTTLS`.
-	Required,
-	/// Use TLS wrapped connection.
-	Wrapper,
-}
-
-impl SmtpSecurity {
-	pub fn to_client_security(self, tls_params: ClientTlsParameters) -> ClientSecurity {
-		match self {
-			Self::None => ClientSecurity::None,
-			Self::Opportunistic => ClientSecurity::Opportunistic(tls_params),
-			Self::Required => ClientSecurity::Required(tls_params),
-			Self::Wrapper => ClientSecurity::Wrapper(tls_params),
-		}
-	}
+	/// The timeout for the connection to the proxy, in ms.
+	pub timeout_ms: Option<u64>,
 }
 
 /// Builder pattern for the input argument into the main `email_exists`
 /// function.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Builder, Debug, Clone, Deserialize, Serialize)]
+#[builder(default)]
 pub struct CheckEmailInput {
 	/// The email to validate.
-	pub to_emails: Vec<String>,
-	/// Email to use in the `MAIL FROM:` SMTP command.
+	pub to_email: String,
+
+	pub verif_method: VerifMethod,
+
+	/// Whether to check if a gravatar image is existing for the given email.
+	/// Adds a bit of latency to the verification process.
 	///
-	/// Defaults to "user@example.org".
-	pub from_email: String,
-	/// Name to use in the `EHLO:` SMTP command.
+	/// Defaults to false.
+	pub check_gravatar: bool,
+	/// Check if a the email address is present in HaveIBeenPwned API.
+	/// If the api_key is filled, HaveIBeenPwned API is checked
+	pub haveibeenpwned_api_key: Option<String>,
+
+	/// The WebDriver address to use for headless verifications.
 	///
-	/// Defaults to "localhost" (note: "localhost" is not a FQDN).
-	pub hello_name: String,
-	/// Perform the email verification via the specified SOCK5 proxy. The usage of a
-	/// proxy is optional.
-	pub proxy: Option<CheckEmailInputProxy>,
-	/// SMTP port to use for email validation. Generally, ports 25, 465, 587
-	/// and 2525 are used.
+	/// Defaults to http://localhost:9515.
+	pub webdriver_addr: String,
+	/// The WebDriver configuration to use for headless verifications.
 	///
-	/// Defaults to 25.
-	pub smtp_port: u16,
-	/// Add optional timeout for the SMTP verification step.
-	pub smtp_timeout: Option<Duration>,
-	/// For Yahoo email addresses, use Yahoo's API instead of connecting
-	/// directly to their SMTP servers.
+	/// Defaults to the default WebdriverConfig.
+	pub webdriver_config: WebdriverConfig,
+	/// Identifier for the service currently running Reacher. We recommend
+	/// setting this to an unique identifier of the server where Reacher is
+	/// installed on.
 	///
-	/// Defaults to true.
-	pub yahoo_use_api: bool,
-	/// Number of retries of SMTP connections to do.
+	/// Defaults to "backend-dev".
+	pub backend_name: String,
+	/// Sentry DSN to send errors to Sentry.
 	///
-	/// Defaults to 2 to avoid greylisting.
-	pub retries: usize,
-	/// How to apply TLS to a SMTP client connection.
-	///
-	/// Defaults to Opportunistic.
-	pub smtp_security: SmtpSecurity,
+	/// Defaults to None.
+	pub sentry_dsn: Option<String>,
 }
 
 impl Default for CheckEmailInput {
 	fn default() -> Self {
 		CheckEmailInput {
-			to_emails: vec![],
-			from_email: "user@example.org".into(),
-			hello_name: "localhost".into(),
-			proxy: None,
-			smtp_port: 25,
-			smtp_security: SmtpSecurity::None,
-			smtp_timeout: None,
-			yahoo_use_api: true,
-			retries: 2,
+			to_email: "".into(),
+			verif_method: VerifMethod::default(),
+			check_gravatar: false,
+			haveibeenpwned_api_key: None,
+			webdriver_addr: "http://localhost:9515".into(),
+			webdriver_config: WebdriverConfig::default(),
+			backend_name: "backend-dev".into(),
+			sentry_dsn: None,
 		}
-	}
-}
-
-impl CheckEmailInput {
-	/// Create a new CheckEmailInput.
-	pub fn new(to_emails: Vec<String>) -> CheckEmailInput {
-		CheckEmailInput {
-			to_emails,
-			..Default::default()
-		}
-	}
-
-	/// Set the email to use in the `MAIL FROM:` SMTP command. Defaults to
-	/// `user@example.org` if not explicitly set.
-	#[deprecated(since = "0.8.24", note = "Please use set_from_email instead")]
-	pub fn from_email(&mut self, email: String) -> &mut CheckEmailInput {
-		self.from_email = email;
-		self
-	}
-
-	/// Set the email to use in the `MAIL FROM:` SMTP command. Defaults to
-	/// `user@example.org` if not explicitly set.
-	pub fn set_from_email(&mut self, email: String) -> &mut CheckEmailInput {
-		self.from_email = email;
-		self
-	}
-
-	/// Set the name to use in the `EHLO:` SMTP command. Defaults to `localhost`
-	/// if not explicitly set.
-	#[deprecated(since = "0.8.24", note = "Please use set_hello_name instead")]
-	pub fn hello_name(&mut self, name: String) -> &mut CheckEmailInput {
-		self.hello_name = name;
-		self
-	}
-
-	/// Set the name to use in the `EHLO:` SMTP command. Defaults to `localhost`
-	/// if not explicitly set.
-	pub fn set_hello_name(&mut self, name: String) -> &mut CheckEmailInput {
-		self.hello_name = name;
-		self
-	}
-
-	/// Use the specified SOCK5 proxy to perform email verification.
-	#[deprecated(since = "0.8.24", note = "Please use set_proxy instead")]
-	pub fn proxy(&mut self, proxy_host: String, proxy_port: u16) -> &mut CheckEmailInput {
-		self.proxy = Some(CheckEmailInputProxy {
-			host: proxy_host,
-			port: proxy_port,
-			..Default::default()
-		});
-		self
-	}
-
-	/// Use the specified SOCK5 proxy to perform email verification.
-	pub fn set_proxy(&mut self, proxy: CheckEmailInputProxy) -> &mut CheckEmailInput {
-		self.proxy = Some(proxy);
-		self
-	}
-
-	/// Set the number of SMTP retries to do.
-	pub fn set_retries(&mut self, retries: usize) -> &mut CheckEmailInput {
-		self.retries = retries;
-		self
-	}
-
-	/// Add optional timeout for the SMTP verification step.
-	#[deprecated(since = "0.8.24", note = "Please use set_smtp_timeout instead")]
-	pub fn smtp_timeout(&mut self, duration: Duration) -> &mut CheckEmailInput {
-		self.smtp_timeout = Some(duration);
-		self
-	}
-
-	/// Change the SMTP port.
-	pub fn set_smtp_port(&mut self, port: u16) -> &mut CheckEmailInput {
-		self.smtp_port = port;
-		self
-	}
-
-	/// Set the SMTP client security to use for TLS.
-	pub fn set_smtp_security(&mut self, smtp_security: SmtpSecurity) -> &mut CheckEmailInput {
-		self.smtp_security = smtp_security;
-		self
-	}
-
-	/// Add optional timeout for the SMTP verification step.
-	pub fn set_smtp_timeout(&mut self, duration: Duration) -> &mut CheckEmailInput {
-		self.smtp_timeout = Some(duration);
-		self
-	}
-
-	/// Set whether to use Yahoo's API or connecting directly to their SMTP
-	/// servers. Defaults to true.
-	#[deprecated(since = "0.8.24", note = "Please use set_yahoo_use_api instead")]
-	pub fn yahoo_use_api(&mut self, use_api: bool) -> &mut CheckEmailInput {
-		self.yahoo_use_api = use_api;
-		self
-	}
-
-	/// Set whether to use Yahoo's API or connecting directly to their SMTP
-	/// servers. Defaults to true.
-	pub fn set_yahoo_use_api(&mut self, use_api: bool) -> &mut CheckEmailInput {
-		self.yahoo_use_api = use_api;
-		self
 	}
 }
 
 /// An enum to describe how confident we are that the recipient address is
 /// real.
-#[derive(Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Reachable {
 	/// The email is safe to send.
@@ -241,6 +166,37 @@ pub enum Reachable {
 	Unknown,
 }
 
+/// Details about the email verification used for debugging.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DebugDetails {
+	/// Identifier for the service currently running Reacher.
+	pub backend_name: String,
+	/// Version of Reacher that performed the verification.
+	#[serde(default)]
+	pub reacher_version: String,
+	/// The time when the email verification started.
+	pub start_time: DateTime<Utc>,
+	/// The time when the email verification ended.
+	pub end_time: DateTime<Utc>,
+	/// The duration of the email verification.
+	pub duration: Duration,
+	/// Details about the email verification used for debugging.
+	pub smtp: SmtpDebug,
+}
+
+impl Default for DebugDetails {
+	fn default() -> Self {
+		Self {
+			start_time: SystemTime::now().into(),
+			end_time: SystemTime::now().into(),
+			duration: Duration::default(),
+			smtp: SmtpDebug::default(),
+			backend_name: "backend-dev".into(),
+			reacher_version: crate::CARGO_PKG_VERSION.into(),
+		}
+	}
+}
+
 /// The result of the [check_email](check_email) function.
 #[derive(Debug)]
 pub struct CheckEmailOutput {
@@ -255,6 +211,8 @@ pub struct CheckEmailOutput {
 	pub smtp: Result<SmtpDetails, SmtpError>,
 	/// Details about the email address.
 	pub syntax: SyntaxDetails,
+	/// Details about the email verification used for debugging.
+	pub debug: DebugDetails,
 }
 
 impl Default for CheckEmailOutput {
@@ -266,6 +224,7 @@ impl Default for CheckEmailOutput {
 			mx: Ok(MxDetails::default()),
 			smtp: Ok(SmtpDetails::default()),
 			syntax: SyntaxDetails::default(),
+			debug: DebugDetails::default(),
 		}
 	}
 }
@@ -320,14 +279,20 @@ impl Serialize for CheckEmailOutput {
 			)?,
 		}
 		map.serialize_entry("syntax", &self.syntax)?;
+		map.serialize_entry("debug", &self.debug)?;
 		map.end()
 	}
 }
 
+#[derive(Builder, Clone, Debug, Deserialize, Serialize, Default)]
+pub struct WebdriverConfig {
+	pub binary: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
-	use super::CheckEmailOutput;
-	use async_smtp::smtp::response::{Category, Code, Detail, Response, Severity};
+	use super::{CheckEmailOutput, DebugDetails};
+	use async_smtp::response::{Category, Code, Detail, Response, Severity};
 
 	#[test]
 	fn should_serialize_correctly() {
@@ -349,27 +314,42 @@ mod tests {
 				misc: Ok(super::MiscDetails::default()),
 				mx: Ok(super::MxDetails::default()),
 				syntax: super::SyntaxDetails::default(),
-				smtp: Err(super::SmtpError::SmtpError(r.into())),
+				smtp: Err(super::SmtpError::AsyncSmtpError(r.into())),
+				debug: DebugDetails::default(),
 			}
 		}
 
 		let res = dummy_response_with_message("blacklist");
 		let actual = serde_json::to_string(&res).unwrap();
 		// Make sure the `description` is present with IpBlacklisted.
-		let expected = r#"{"input":"foo","is_reachable":"unknown","misc":{"is_disposable":false,"is_role_account":false},"mx":{"accepts_mail":false,"records":[]},"smtp":{"error":{"type":"SmtpError","message":"transient: blacklist"},"description":"IpBlacklisted"},"syntax":{"address":null,"domain":"","is_valid_syntax":false,"username":""}}"#;
-		assert_eq!(expected, actual);
+		let expected = r#""smtp":{"error":{"type":"AsyncSmtpError","message":"transient: blacklist; 8BITMIME; SIZE 42"},"description":"IpBlacklisted"}"#;
+		assert!(actual.contains(expected));
 
 		let res =
 			dummy_response_with_message("Client host rejected: cannot find your reverse hostname");
 		let actual = serde_json::to_string(&res).unwrap();
 		// Make sure the `description` is present with NeedsRDNs.
-		let expected = r#"{"input":"foo","is_reachable":"unknown","misc":{"is_disposable":false,"is_role_account":false},"mx":{"accepts_mail":false,"records":[]},"smtp":{"error":{"type":"SmtpError","message":"transient: Client host rejected: cannot find your reverse hostname"},"description":"NeedsRDNS"},"syntax":{"address":null,"domain":"","is_valid_syntax":false,"username":""}}"#;
-		assert_eq!(expected, actual);
+		let expected = r#"smtp":{"error":{"type":"AsyncSmtpError","message":"transient: Client host rejected: cannot find your reverse hostname; 8BITMIME; SIZE 42"},"description":"NeedsRDNS"}"#;
+		assert!(actual.contains(expected));
 
 		let res = dummy_response_with_message("foobar");
 		let actual = serde_json::to_string(&res).unwrap();
 		// Make sure the `description` is NOT present.
-		let expected = r#"{"input":"foo","is_reachable":"unknown","misc":{"is_disposable":false,"is_role_account":false},"mx":{"accepts_mail":false,"records":[]},"smtp":{"error":{"type":"SmtpError","message":"transient: foobar"}},"syntax":{"address":null,"domain":"","is_valid_syntax":false,"username":""}}"#;
-		assert_eq!(expected, actual);
+		let expected = r#""smtp":{"error":{"type":"AsyncSmtpError","message":"transient: foobar; 8BITMIME; SIZE 42"}}"#;
+		assert!(actual.contains(expected));
+	}
+
+	#[test]
+	fn should_serialize_reacher_version() {
+		let actual = serde_json::to_value(DebugDetails::default()).unwrap();
+		assert_eq!(actual["reacher_version"], crate::CARGO_PKG_VERSION);
+	}
+
+	#[test]
+	fn should_deserialize_without_reacher_version() {
+		let mut value = serde_json::to_value(DebugDetails::default()).unwrap();
+		value.as_object_mut().unwrap().remove("reacher_version");
+		let debug: DebugDetails = serde_json::from_value(value).unwrap();
+		assert_eq!(debug.reacher_version, "");
 	}
 }

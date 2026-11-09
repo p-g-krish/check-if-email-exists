@@ -1,19 +1,3 @@
-// check-if-email-exists
-// Copyright (C) 2018-2022 Reacher
-
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published
-// by the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-
-// You should have received a copy of the GNU Affero General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
 //! `check-if-email-exists` lets you check if an email address exists without
 //! sending any email.
 //!
@@ -23,33 +7,52 @@
 //! - Email deliverability: Is an email sent to this address deliverable?
 //! - Syntax validation. Is the address syntactically valid?
 //! - DNS records validation. Does the domain of the email address have valid
-//! MX DNS records?
+//!   MX DNS records?
 //! - Disposable email address (DEA) validation. Is the address provided by a
-//! known disposable email address provider?
+//!   known disposable email address provider?
 //! - SMTP server validation. Can the mail exchanger of the email address
-//! domain be contacted successfully?
+//!   domain be contacted successfully?
 //! - Mailbox disabled. Has this email address been disabled by the email
-//! provider?
+//!   provider?
 //! - Full inbox. Is the inbox of this mailbox full?
 //! - Catch-all address. Is this email address a catch-all address?
 //!
 //! ```rust
-//! use check_if_email_exists::{check_email, CheckEmailInput, CheckEmailInputProxy};
+//! use check_if_email_exists::{check_email, CheckEmailInputBuilder, CheckEmailInputProxy};
+//! use check_if_email_exists::smtp::verif_method::{VerifMethod, VerifMethodSmtpConfig, GmailVerifMethod};
+//! use std::collections::HashMap;
 //!
 //! async fn check() {
 //!     // Let's say we want to test the deliverability of someone@gmail.com.
-//!     let mut input = CheckEmailInput::new(vec!["someone@gmail.com".into()]);
 //!
-//!     // Optionally, we can also tweak the configuration parameters used in the
-//!     // verification.
-//!     input
-//!         .set_from_email("me@example.org".into()) // Used in the `MAIL FROM:` command
-//!         .set_hello_name("example.org".into())    // Used in the `EHLO` command
-//!         .set_smtp(587)                           // Use port 587 instead of 25
-//!         .set_proxy(CheckEmailInputProxy {        // Use a SOCKS5 proxy to verify the email
-//!             host: "my-proxy.io".into(),
-//!             port: 1080
+//!     // We can tweak how we want to verify the email address, though using
+//!     // the default values is usually enough. However, if you want to use a
+//!     // proxy, you can do so like this:
+//!     let mut proxies = HashMap::new();
+//!     proxies.insert("proxy1".to_string(), CheckEmailInputProxy {
+//!         host: "my-proxy.io".to_string(),             // Use a SOCKS5 proxy to verify the email
+//!         port: 1080,
+//!         username: None,                              // You can also set it non-empty
+//!         password: None,
+//!         timeout_ms: None,
 //!     });
+//!     let verif_method = VerifMethod {
+//!         proxies,
+//!         gmail: GmailVerifMethod::Smtp(VerifMethodSmtpConfig {
+//!            from_email: "me@example.org".to_string(), // Used in the `MAIL FROM:` command
+//!            hello_name: "example.org".to_string(),    // Used in the `EHLO` command
+//!            smtp_port: 587,                           // Use port 587 instead of 25
+//!            proxy: Some("proxy1".to_string()),        // Use the proxy we defined above
+//!            ..Default::default()
+//!         }),
+//!         ..Default::default()
+//!     };
+//!
+//!     let input = CheckEmailInputBuilder::default()
+//!         .to_email("someone@gmail.com".into())
+//!         .verif_method(verif_method)
+//!         .build()
+//!         .unwrap();
 //!
 //!     // Verify this input, using async/await syntax.
 //!     let result = check_email(&input).await;
@@ -60,22 +63,47 @@
 //! }
 //! ```
 
+mod haveibeenpwned;
 pub mod misc;
 pub mod mx;
+mod rules;
 pub mod smtp;
 pub mod syntax;
 mod util;
 
-use futures::future;
 use misc::{check_misc, MiscDetails};
 use mx::check_mx;
+use rustls::crypto::ring;
 use smtp::{check_smtp, SmtpDetails, SmtpError};
-use syntax::check_syntax;
-use util::constants::LOG_TARGET;
+pub use smtp::{is_gmail, is_hotmail, is_hotmail_b2b, is_hotmail_b2c, is_yahoo};
+use std::sync::Once;
+use std::time::{Duration, SystemTime};
+use syntax::{check_syntax, get_similar_mail_provider};
 pub use util::input_output::*;
+#[cfg(feature = "sentry")]
+pub use util::sentry::*;
+
+/// The target where to log check-if-email-exists logs.
+pub const LOG_TARGET: &str = "reacher";
+
+/// The version of Reacher, as defined in Cargo.toml.
+pub const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+static INIT: Once = Once::new();
+
+/// check-if-email-exists uses rustls for its TLS connections. This function
+/// initializes the default crypto provider for rustls.
+pub fn initialize_crypto_provider() {
+	INIT.call_once(|| {
+		ring::default_provider().install_default().unwrap();
+	});
+}
 
 /// Given an email's misc and smtp details, calculate an estimate of our
 /// confidence on how reachable the email is.
+///
+/// Maybe we can switch to a points-based system?
+/// ref: https://github.com/reacherhq/check-if-email-exists/issues/935
 fn calculate_reachable(misc: &MiscDetails, smtp: &Result<SmtpDetails, SmtpError>) -> Reachable {
 	if let Ok(smtp) = smtp {
 		if misc.is_disposable || misc.is_role_account || smtp.is_catch_all || smtp.has_full_inbox {
@@ -92,23 +120,27 @@ fn calculate_reachable(misc: &MiscDetails, smtp: &Result<SmtpDetails, SmtpError>
 	}
 }
 
-/// Check a single emails. This assumes this `input.check_email` contains
-/// exactly one element. If it contains more, elements other than the first
-/// one will be ignored.
+/// The main function of this library: verify a single email. Performs, in the
+/// following order, 4 types of verifications:
+/// - syntax check: verify the email is well-formed,
+/// - MX checks: verify the domain is configured to receive email,
+/// - SMTP checks: connect to the SMTP server and verify the email is
+///   deliverable,
+/// - misc checks: metadata about the email provider.
 ///
-/// # Panics
-///
-/// This function panics if `input.check_email` is empty.
-async fn check_single_email(input: CheckEmailInput) -> CheckEmailOutput {
-	let to_email = &input.to_emails[0];
+/// Returns a `CheckEmailOutput` output, whose `is_reachable` field is one of
+/// `Safe`, `Invalid`, `Risky` or `Unknown`.
+pub async fn check_email(input: &CheckEmailInput) -> CheckEmailOutput {
+	initialize_crypto_provider();
+	let start_time = SystemTime::now();
+	let to_email = &input.to_email;
 
-	log::debug!(
+	tracing::debug!(
 		target: LOG_TARGET,
-		"email={} Checking email \"{}\"",
-		to_email,
-		to_email
+		email=%to_email,
+		"Checking email"
 	);
-	let my_syntax = check_syntax(to_email.as_ref());
+	let mut my_syntax = check_syntax(to_email.as_ref());
 	if !my_syntax.is_valid_syntax {
 		return CheckEmailOutput {
 			input: to_email.to_string(),
@@ -118,16 +150,18 @@ async fn check_single_email(input: CheckEmailInput) -> CheckEmailOutput {
 		};
 	}
 
-	log::debug!(
+	tracing::debug!(
 		target: LOG_TARGET,
-		"email={} Found the following syntax validation: {:?}",
-		to_email,
-		my_syntax
+		email=%to_email,
+		syntax=?my_syntax,
+		"Found syntax validation"
 	);
 
 	let my_mx = match check_mx(&my_syntax).await {
 		Ok(m) => m,
 		e => {
+			get_similar_mail_provider(&mut my_syntax);
+
 			// This happens when there's an internal error while checking MX
 			// records. Should happen fairly rarely.
 			return CheckEmailOutput {
@@ -140,8 +174,11 @@ async fn check_single_email(input: CheckEmailInput) -> CheckEmailOutput {
 		}
 	};
 
-	// Return if we didn't find any MX records.
-	if my_mx.lookup.is_err() {
+	// Return if we didn't find any MX records, or if the domain can't receive
+	// mail (null MX, or no MX host resolves).
+	if my_mx.lookup.is_err() || !my_mx.accepts_mail {
+		get_similar_mail_provider(&mut my_syntax);
+
 		return CheckEmailOutput {
 			input: to_email.to_string(),
 			is_reachable: Reachable::Invalid,
@@ -151,107 +188,83 @@ async fn check_single_email(input: CheckEmailInput) -> CheckEmailOutput {
 		};
 	}
 
-	log::debug!(
-		target: LOG_TARGET,
-		"email={} Found the following MX hosts: {:?}",
-		to_email,
-		my_mx
-			.lookup
-			.as_ref()
-			.expect("If lookup is error, we already returned. qed.")
-			.iter()
-			.map(|host| host.exchange().to_string())
-			.collect::<Vec<String>>()
-	);
-
-	let my_misc = check_misc(&my_syntax);
-	log::debug!(
-		target: LOG_TARGET,
-		"email={} Found the following misc details: {:?}",
-		to_email,
-		my_misc
-	);
-
-	// We loop through all the MX records, and check each one of them. This is
-	// because to prevent SPAM, some servers put a dummy server as 1st MX
-	// record.
-	// ref: https://github.com/reacherhq/check-if-email-exists/issues/1049
-	let mut my_smtp: Option<Result<SmtpDetails, SmtpError>> = None;
-	for host in my_mx
+	let mx_hosts: Vec<String> = my_mx
 		.lookup
 		.as_ref()
 		.expect("If lookup is error, we already returned. qed.")
 		.iter()
-	{
-		let res = check_smtp(
-			my_syntax
-				.address
-				.as_ref()
-				.expect("We already checked that the email has valid format. qed."),
-			host.exchange(),
-			input.smtp_port,
-			my_syntax.domain.as_ref(),
-			&input,
-		)
-		.await;
-		let is_reachable = res.is_ok();
-		my_smtp = Some(res);
-		if !is_reachable {
-			continue; // If error, then we move on to next MX record.
-		} else {
-			break; // If successful, then we break.
-		}
-	}
-	let my_smtp = my_smtp.expect(
-		"As long as lookup has at least 1 element (which we checked), my_smtp will be a Some. qed.",
+		.map(|host| host.to_string())
+		.collect();
+
+	tracing::debug!(
+		target: LOG_TARGET,
+		email=%to_email,
+		mx_hosts=?mx_hosts,
+		"Found MX hosts"
 	);
 
-	CheckEmailOutput {
+	let my_misc = check_misc(
+		&my_syntax,
+		input.check_gravatar,
+		input.haveibeenpwned_api_key.clone(),
+	)
+	.await;
+
+	tracing::debug!(
+		target: LOG_TARGET,
+		email=%to_email,
+		misc=?my_misc,
+		"Found misc details"
+	);
+
+	// From the list of MX records, we choose the one with the lowest priority.
+	let mx_records = my_mx
+		.lookup
+		.as_ref()
+		.expect("If lookup is error, we already returned. qed.")
+		.iter()
+		.min_by_key(|a| a.preference())
+		.expect("There should be at least one MX record after filtering.");
+	let host = mx_records;
+
+	let (my_smtp, smtp_debug) = check_smtp(
+		my_syntax
+			.address
+			.as_ref()
+			.expect("We already checked that the email has valid format. qed."),
+		host.exchange(),
+		my_syntax.domain.as_ref(),
+		input,
+	)
+	.await;
+
+	if my_smtp.is_err() {
+		get_similar_mail_provider(&mut my_syntax);
+	}
+
+	let end_time = SystemTime::now();
+
+	let output = CheckEmailOutput {
 		input: to_email.to_string(),
 		is_reachable: calculate_reachable(&my_misc, &my_smtp),
 		misc: Ok(my_misc),
 		mx: Ok(my_mx),
 		smtp: my_smtp,
 		syntax: my_syntax,
-	}
-}
+		debug: DebugDetails {
+			start_time: start_time.into(),
+			end_time: end_time.into(),
+			duration: end_time
+				.duration_since(start_time)
+				.unwrap_or(Duration::from_secs(0)),
+			smtp: smtp_debug,
+			backend_name: input.backend_name.clone(),
+			reacher_version: CARGO_PKG_VERSION.into(),
+		},
+	};
 
-/// The main function of this library: takes as input a list of email addresses
-/// to check. Then performs syntax, mx, smtp and misc checks, and outputs a
-/// list of results.
-///
-/// Please note that checking multiple emails at once (by putting multiple
-/// emails in the `inputs.to_emails` Vec) is still a **beta** feature, and not
-/// fully optimized. For more info, see #65
-/// <https://github.com/reacherhq/check-if-email-exists/issues/65>.
-pub async fn check_email(inputs: &CheckEmailInput) -> Vec<CheckEmailOutput> {
-	if inputs.to_emails.len() > 1 {
-		log::warn!(
-			target: LOG_TARGET,
-			"Verifying multiple emails with this library is still a beta feature, please don't overuse it. See reacherhq/check-if-email-exists #65."
-		);
-	}
+	#[cfg(feature = "sentry")]
+	log_unknown_errors(&output, &input.backend_name);
 
-	// FIXME Obviously, the below `join_all` is not optimal. Some optimizations
-	// include:
-	// - if multiple email addresses share the same domain, we should only do
-	// `check_mx` call for all these email addresses.
-	// - if multiple email addresses share the same domain, we should call
-	// `check_smtp` with grouped email addresses, to share a SMTP connection.
-	// ref: https://github.com/reacherhq/check-if-email-exists/issues/65.
-	let inputs = inputs.to_emails.iter().map(|email| {
-		// Create n `CheckEmailInput`s, each with one email address.
-		CheckEmailInput {
-			to_emails: vec![email.clone()],
-			from_email: inputs.from_email.clone(),
-			hello_name: inputs.hello_name.clone(),
-			proxy: inputs.proxy.clone(),
-			retries: inputs.retries,
-			smtp_port: inputs.smtp_port,
-			smtp_security: inputs.smtp_security,
-			smtp_timeout: inputs.smtp_timeout,
-			yahoo_use_api: inputs.yahoo_use_api,
-		}
-	});
-	future::join_all(inputs.map(check_single_email)).await
+	output
 }

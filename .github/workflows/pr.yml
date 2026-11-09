@@ -1,6 +1,6 @@
 # Based on https://github.com/actions-rs/meta/blob/master/recipes/quickstart.md
 
-name: CI
+name: pr
 
 on:
   pull_request:
@@ -8,8 +8,15 @@ on:
     branches:
       - master
 
+# For backend, run builds and tests without sqlx's compile time query checks
+# https://github.com/launchbadge/sqlx/blob/master/sqlx-cli/README.md#force-building-in-offline-mode
+env:
+  SQLX_OFFLINE: true
+
 jobs:
-  lints:
+  # Cargo fmt, clippy and test, in a single job so they share one Rust cache.
+  # Clippy also covers what `cargo check` used to.
+  check:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
@@ -23,6 +30,11 @@ jobs:
           override: true
           components: rustfmt, clippy
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Only save caches from master, so PRs don't evict each other.
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
       - name: Run cargo fmt
         uses: actions-rs/cargo@v1
         with:
@@ -33,4 +45,10 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: clippy
-          args: -- -D warnings -A deprecated
+          args: --all -- -A deprecated
+
+      - name: Run cargo test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --all
